@@ -1,0 +1,33 @@
+{
+  "name": "pi-asterlab-provider",
+  "version": "0.1.0",
+  "description": "AsterLab provider extension for pi (OpenAI-compatible chat completions, runtime model discovery with live verification, /login support).",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "test": "node test/asterlab.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "keywords": ["pi", "pi-package", "pi-extension", "asterlab", "provider", "llm"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/perezdap/pi-asterlab-provider.git"
+  },
+  "homepage": "https://github.com/perezdap/pi-asterlab-provider",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.85.0",
+    "@earendil-works/pi-coding-agent": ">=0.85.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.85.0",
+    "@earendil-works/pi-coding-agent": "^0.85.0",
+    "typescript": "^5.9.3"
+  }
+}
