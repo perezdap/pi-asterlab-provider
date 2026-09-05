@@ -43,17 +43,28 @@
  *     repeated prompt returns `cached_tokens` with no markers sent — so the
  *     cached-input rate maps to cost.cacheRead and nothing extra is sent.
  *
- * Context windows are clamped to what AsterLab actually serves. /v1/models
- * advertises context_length: 1048576 for glm-5.2 and kimi-k3, but live probes
- * (2026-09-04) show 639,403 prompt tokens succeeding in ~115s while ~660k tokens
- * hits AsterLab's ~300s serverless function timeout (HTTP 504
- * FUNCTION_INVOCATION_TIMEOUT), and any request body over ~4.2MB fails outright
- * with HTTP 413 FUNCTION_PAYLOAD_TOO_LARGE regardless of token count. Declaring
- * the un-servable 1M would let pi walk past the real ceiling into a five-minute
- * hang followed by an error pi cannot classify, so MAX_SERVABLE_PROMPT_TOKENS
- * clamps the window and a message_end handler rewrites AsterLab's distinctive
- * payload-too-large body into pi's generic `context_length_exceeded` prefix,
- * which enables pi's compact-and-retry recovery.
+ * Context windows are reported exactly as AsterLab advertises them, because the
+ * advertised value was verified servable end-to-end: 1,047,626 prompt tokens on
+ * glm-5.2 and 1,039,708 on kimi-k3 both returned HTTP 200, while ~1.1M tokens
+ * was refused. Two SEPARATE limits sit below that ceiling and are not context
+ * windows, so they are not encoded as one:
+ *
+ *   - A hard 4 MiB request-body cap. A 4,194,304-byte body succeeds; 96 bytes
+ *     more returns HTTP 400 `upstream_error`, and ~4.3MB+ returns HTTP 413
+ *     `FUNCTION_PAYLOAD_TOO_LARGE`. This is a byte limit, so where it bites
+ *     depends on text density (~729k tokens for prose, ~2.1M for dense code).
+ *   - A ~300s serverless function timeout that can return HTTP 504
+ *     `FUNCTION_INVOCATION_TIMEOUT` on very large prompts. It is transient and
+ *     load-dependent: one probe 504'd at ~660k tokens and the identical request
+ *     later succeeded in seconds.
+ *
+ * A message_end handler rewrites the distinctive 413 payload-too-large body into
+ * pi's generic `context_length_exceeded` prefix so pi compacts and retries. The
+ * 400 and 504 are deliberately left alone: AsterLab's 400 body carries no
+ * detail that distinguishes overflow from any other upstream refusal, and the
+ * 504 is a timeout rather than a definitive overflow, so rewriting either would
+ * make pi compact on errors that belong to its normal retry path. See
+ * PI_ASTERLAB_CONTEXT_WINDOW below for adjusting the reported window.
  *
  * Usage:
  *   /login asterlab        # enter your AsterLab API key (or export ASTERLAB_API_KEY)
@@ -83,18 +94,25 @@ const API_KEY_ENV_VAR = "ASTERLAB_API_KEY";
 // of these verbatim on the models probed, and "none" disables thinking.
 const PI_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
+/** Used only when a listed model reports no usable context_length. */
 const DEFAULT_CONTEXT_WINDOW = 131_072;
 const DEFAULT_MAX_TOKENS = 16_384;
 
 /**
- * Largest prompt AsterLab was verified to serve (2026-09-04, glm-5.2):
- * 639,403 tokens -> HTTP 200 in ~115s. ~660k tokens -> HTTP 504
- * FUNCTION_INVOCATION_TIMEOUT after ~300s, and any body over ~4.2MB -> HTTP 413
- * FUNCTION_PAYLOAD_TOO_LARGE. The advertised context_length (1048576) is
- * therefore not servable end-to-end. Re-probe and raise this if AsterLab lifts
- * the function timeout or the payload cap.
+ * Optional ceiling on the reported context window, in tokens. AsterLab's
+ * advertised context_length was verified servable (1,047,626 tokens -> HTTP 200
+ * on glm-5.2), so by default nothing is clamped and the picker shows the real
+ * number. Set this only if you want pi to compact earlier than the model's true
+ * limit — for example to stay clear of AsterLab's hard 4 MiB request-body cap
+ * (4,194,304 bytes succeeds, 96 bytes more returns HTTP 400) or its ~300s
+ * serverless timeout on very large prompts:
+ *
+ *   PI_ASTERLAB_CONTEXT_WINDOW=640000
+ *
+ * Values are clamped to [1, advertised]; a non-numeric or non-positive value is
+ * ignored. See README "Adjusting the context window".
  */
-const MAX_SERVABLE_PROMPT_TOKENS = 640_000;
+const CONTEXT_WINDOW_ENV_VAR = "PI_ASTERLAB_CONTEXT_WINDOW";
 
 const DISCOVERY_TIMEOUT_MS = 15_000;
 /** Budget for the whole parallel verification pass, not per model. */
@@ -193,6 +211,8 @@ interface DiscoveredCatalog {
 	excluded: { id: string; reason: string }[];
 	/** True when the probe ran, so `reasoning` is measured rather than assumed. */
 	verified: boolean;
+	/** The PI_ASTERLAB_CONTEXT_WINDOW ceiling in effect, if any. */
+	ceiling?: number;
 }
 
 /** Strip an org prefix ("zai-org/glm-5.2-batch" -> "glm-5.2-batch") for matching. */
@@ -254,6 +274,35 @@ function maxOutputFor(id: string, contextWindow: number): number {
 function reasoningByFamily(id: string): boolean {
 	const bare = bareId(id);
 	return REASONING_PATTERNS.some((pattern) => pattern.test(bare));
+}
+
+/**
+ * Resolve the optional PI_ASTERLAB_CONTEXT_WINDOW ceiling. Returns undefined
+ * when unset, non-numeric, or non-positive, so the advertised window stands.
+ */
+function contextWindowCeiling(env: Record<string, string | undefined> | undefined): number | undefined {
+	const raw = env?.[CONTEXT_WINDOW_ENV_VAR]?.trim();
+	if (!raw) return undefined;
+	const value = Number.parseInt(raw, 10);
+	if (!Number.isFinite(value) || value <= 0) {
+		console.warn(
+			`[asterlab] ignoring ${CONTEXT_WINDOW_ENV_VAR}=${raw}: expected a positive integer number of tokens.`,
+		);
+		return undefined;
+	}
+	return value;
+}
+
+/**
+ * Context window for a listed model: AsterLab's advertised context_length,
+ * optionally lowered by PI_ASTERLAB_CONTEXT_WINDOW. Never raised above what
+ * AsterLab reports — the advertised 1048576 was verified servable end-to-end,
+ * and inventing a larger number would let pi overflow the real limit.
+ */
+function contextWindowFor(m: AsterLabModel, ceiling: number | undefined): number {
+	const advertised =
+		typeof m.context_length === "number" && m.context_length > 0 ? m.context_length : DEFAULT_CONTEXT_WINDOW;
+	return ceiling === undefined ? advertised : Math.min(advertised, ceiling);
 }
 
 /**
@@ -350,6 +399,7 @@ async function discoverAsterLabModels(signal?: AbortSignal): Promise<DiscoveredC
 	const env = typeof process === "undefined" ? undefined : process.env;
 	const apiKey = env?.[API_KEY_ENV_VAR];
 	const skipVerify = ["1", "true", "yes"].includes((env?.PI_ASTERLAB_SKIP_VERIFY ?? "").toLowerCase());
+	const ceiling = contextWindowCeiling(env);
 
 	const probes = new Map<string, ProbeResult>();
 	if (apiKey && !skipVerify && chatModels.length > 0) {
@@ -373,10 +423,7 @@ async function discoverAsterLabModels(signal?: AbortSignal): Promise<DiscoveredC
 		const reasoning = probe?.status === "ok" ? probe.reasoning : reasoningByFamily(m.id);
 		const pricing = m.pricing ?? {};
 		// AsterLab reports both short and explicit per-million keys; they agree.
-		const contextWindow = Math.min(
-			typeof m.context_length === "number" && m.context_length > 0 ? m.context_length : DEFAULT_CONTEXT_WINDOW,
-			MAX_SERVABLE_PROMPT_TOKENS,
-		);
+		const contextWindow = contextWindowFor(m, ceiling);
 
 		const model = {
 			id: m.id,
@@ -419,11 +466,11 @@ async function discoverAsterLabModels(signal?: AbortSignal): Promise<DiscoveredC
 	}
 
 	models.sort((a, b) => a.name.localeCompare(b.name));
-	return { models, excluded, verified };
+	return { models, excluded, verified, ceiling };
 }
 
 /**
- * AsterLab's request-body cap, surfaced by pi as
+ * AsterLab's 4 MiB request-body cap, surfaced by pi as
  * `413: {"code":"413","message":"Request Entity Too Large"}`. None of pi's
  * overflow patterns match it (its `request_too_large` pattern expects
  * underscores), so pi cannot auto-compact without this rewrite.
@@ -436,6 +483,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		catalog = await discoverAsterLabModels();
 		for (const entry of catalog.excluded) {
 			console.warn(`[asterlab] excluded ${entry.id}: ${entry.reason}`);
+		}
+		if (catalog.ceiling !== undefined) {
+			console.warn(
+				`[asterlab] ${CONTEXT_WINDOW_ENV_VAR}=${catalog.ceiling}: context windows capped below AsterLab's advertised values.`,
+			);
 		}
 		if (!catalog.verified) {
 			console.warn(
@@ -467,9 +519,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	// Rewrite AsterLab's payload-cap error into pi's generic overflow prefix so
 	// pi drops the failed message, compacts, and retries once. Scoped to this
-	// provider and to that exact phrase: the 504 FUNCTION_INVOCATION_TIMEOUT that
-	// large prompts can also hit is left alone, since it is a serverless timeout
-	// rather than a definitive overflow and belongs to pi's normal retry path.
+	// provider and to that exact phrase. The HTTP 400 `upstream_error` that the
+	// same cap produces just above 4 MiB, and the 504 FUNCTION_INVOCATION_TIMEOUT
+	// that very large prompts can hit, are deliberately NOT rewritten: the 400
+	// body carries no detail distinguishing overflow from any other upstream
+	// refusal, and the 504 is a transient serverless timeout. Rewriting either
+	// would make pi compact on errors that belong to its normal retry path.
+	// Lower PI_ASTERLAB_CONTEXT_WINDOW to stay clear of both.
 	pi.on(
 		"message_end",
 		((

@@ -7,6 +7,7 @@
 //
 // Set PI_ASTERLAB_SKIP_VERIFY=1 to run the mapping assertions without spending
 // probe requests (reasoning then falls back to the family table).
+// Set PI_ASTERLAB_CONTEXT_WINDOW=<tokens> to exercise the optional ceiling.
 
 let pass = 0;
 let fail = 0;
@@ -47,6 +48,8 @@ const pi = {
 const hasKey = Boolean(process.env.ASTERLAB_API_KEY);
 const skippingVerify = ["1", "true", "yes"].includes((process.env.PI_ASTERLAB_SKIP_VERIFY ?? "").toLowerCase());
 const willProbe = hasKey && !skippingVerify;
+const ceilingRaw = process.env.PI_ASTERLAB_CONTEXT_WINDOW?.trim();
+const ceiling = ceilingRaw && Number.parseInt(ceilingRaw, 10) > 0 ? Number.parseInt(ceilingRaw, 10) : undefined;
 
 await factory(pi);
 console.warn = realWarn;
@@ -120,8 +123,6 @@ for (const m of models) {
 	assert(m.contextWindow > 0, `model ${m.id}: contextWindow > 0`);
 	assert(m.maxTokens > 0, `model ${m.id}: maxTokens > 0`);
 	assert(m.maxTokens <= m.contextWindow, `model ${m.id}: maxTokens <= contextWindow`);
-	// The advertised 1M window is not servable; the clamp must hold for every model.
-	assert(m.contextWindow <= 640_000, `model ${m.id}: contextWindow clamped to the servable ceiling`);
 	assert(typeof m.cost.input === "number", `model ${m.id}: cost.input is number`);
 	assert(typeof m.cost.output === "number", `model ${m.id}: cost.output is number`);
 	assert(typeof m.cost.cacheRead === "number", `model ${m.id}: cost.cacheRead is number`);
@@ -163,6 +164,13 @@ for (const m of models) {
 			`model ${m.id}: cost.cacheRead from cached_input rate`,
 		);
 	}
+	// Context window: AsterLab's advertised value, unless the optional ceiling
+	// lowers it. Never invented, never raised above what AsterLab reports.
+	if (live) {
+		const advertised = typeof live.context_length === "number" && live.context_length > 0 ? live.context_length : 131_072;
+		const expected = ceiling === undefined ? advertised : Math.min(advertised, ceiling);
+		assertEq(m.contextWindow, expected, `model ${m.id}: contextWindow matches the listing${ceiling ? " under the ceiling" : ""}`);
+	}
 }
 
 // Models are sorted by display name for a stable picker.
@@ -174,9 +182,10 @@ const glm = models.find((m) => m.id === "glm-5.2");
 if (glm) {
 	assertEq(glm.name, "GLM-5.2", "glm-5.2 display name");
 	assertEq(glm.reasoning, true, "glm-5.2 is a reasoning model");
-	// Listing advertises 1048576; the servable clamp wins.
-	assertEq(glm.contextWindow, 640_000, "glm-5.2 contextWindow clamped from the advertised 1M");
-	assertEq(glm.maxTokens, 131_072, "glm-5.2 maxTokens from the Z.AI family cap");
+	// The advertised 1048576 was verified servable (1,047,626 tokens -> HTTP 200),
+	// so it is reported as-is unless PI_ASTERLAB_CONTEXT_WINDOW lowers it.
+	assertEq(glm.contextWindow, Math.min(1_048_576, ceiling ?? 1_048_576), "glm-5.2 contextWindow from the listing");
+	assertEq(glm.maxTokens, Math.min(131_072, glm.contextWindow), "glm-5.2 maxTokens from the Z.AI family cap");
 	assertEq(glm.cost.input, 1, "glm-5.2 cost.input = $1/M");
 	assertEq(glm.cost.output, 4, "glm-5.2 cost.output = $4/M");
 	assertEq(glm.cost.cacheRead, 0.2, "glm-5.2 cost.cacheRead = $0.20/M");
@@ -186,8 +195,8 @@ const kimi = models.find((m) => m.id === "kimi-k3");
 if (kimi) {
 	assertEq(kimi.name, "Kimi K3", "kimi-k3 display name");
 	assertEq(kimi.reasoning, true, "kimi-k3 is a reasoning model");
-	assertEq(kimi.contextWindow, 640_000, "kimi-k3 contextWindow clamped from the advertised 1M");
-	assertEq(kimi.maxTokens, 131_072, "kimi-k3 maxTokens from the Moonshot family cap");
+	assertEq(kimi.contextWindow, Math.min(1_048_576, ceiling ?? 1_048_576), "kimi-k3 contextWindow from the listing");
+	assertEq(kimi.maxTokens, Math.min(131_072, kimi.contextWindow), "kimi-k3 maxTokens from the Moonshot family cap");
 	assertEq(kimi.input.includes("image"), true, "kimi-k3 accepts image input (verified live)");
 	assert(kimi.cost.cacheRead > 0, "kimi-k3 exposes a cached-input rate");
 }
@@ -281,11 +290,27 @@ assertEq(
 	"FUNCTION_INVOCATION_TIMEOUT is not rewritten as overflow",
 );
 
+// The bare 400 upstream_error is NOT rewritten either: AsterLab's body carries no
+// detail distinguishing overflow from any other upstream refusal, so rewriting it
+// would make pi compact on errors that belong to its normal retry path.
+assertEq(
+	runHook(
+		{
+			role: "assistant",
+			stopReason: "error",
+			provider: "asterlab",
+			errorMessage: '400: {"message":"The upstream model provider returned an error.","type":"upstream_error","code":null}',
+		},
+		asterlabModel,
+	),
+	undefined,
+	"bare 400 upstream_error is not rewritten as overflow",
+);
+
 // Rate limits and upstream refusals are not overflows either.
 for (const errorMessage of [
 	'429: {"message":"Too many requests"}',
 	'404: {"message":"The upstream model provider returned an error.","type":"invalid_request_error"}',
-	'400: {"message":"The upstream model provider returned an error.","type":"upstream_error"}',
 ]) {
 	assertEq(
 		runHook({ role: "assistant", stopReason: "error", provider: "asterlab", errorMessage }, asterlabModel),
@@ -337,6 +362,75 @@ const noneCtx = { env: async () => undefined };
 const none = await auth.resolve({ ctx: noneCtx, credential: undefined, signal: { throwIfAborted() {} } });
 assertEq(none, undefined, "resolve(): undefined when nothing configured");
 
-console.log(`\nmodels: ${models.map((m) => m.id).join(", ")}`);
+// ---- PI_ASTERLAB_CONTEXT_WINDOW ceiling ----
+// The factory reads process.env at call time, so re-run it with the variable set
+// to confirm the ceiling lowers windows, never raises them, and is reported.
+async function runWithEnv(overrides) {
+	const saved = {};
+	for (const [key, value] of Object.entries(overrides)) {
+		saved[key] = process.env[key];
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	const localRegistered = [];
+	const localWarnings = [];
+	const restoreWarn = console.warn;
+	console.warn = (...args) => localWarnings.push(args.join(" "));
+	try {
+		await factory({ registerProvider: (p) => localRegistered.push(p), on: () => {} });
+	} finally {
+		console.warn = restoreWarn;
+		for (const [key, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+	return { provider: localRegistered[0], warnings: localWarnings };
+}
+
+const advertisedById = new Map(models.map((m) => [m.id, listedById.get(m.id)?.context_length ?? 131_072]));
+
+// A ceiling below the advertised window lowers it and is reported.
+const capped = await runWithEnv({ PI_ASTERLAB_CONTEXT_WINDOW: "200000", PI_ASTERLAB_SKIP_VERIFY: "1" });
+assert(!!capped.provider, "ceiling run registers a provider");
+for (const m of capped.provider.getModels()) {
+	const advertised = advertisedById.get(m.id) ?? 131_072;
+	assertEq(m.contextWindow, Math.min(advertised, 200_000), `ceiling=200000: ${m.id} contextWindow`);
+	assert(m.maxTokens <= m.contextWindow, `ceiling=200000: ${m.id} maxTokens <= contextWindow`);
+}
+assert(
+	capped.warnings.some((line) => line.includes("PI_ASTERLAB_CONTEXT_WINDOW=200000")),
+	"ceiling in effect is reported at load time",
+);
+
+// A ceiling ABOVE the advertised window must not inflate it.
+const inflated = await runWithEnv({ PI_ASTERLAB_CONTEXT_WINDOW: "99000000", PI_ASTERLAB_SKIP_VERIFY: "1" });
+for (const m of inflated.provider.getModels()) {
+	assertEq(
+		m.contextWindow,
+		advertisedById.get(m.id) ?? 131_072,
+		`ceiling=99000000: ${m.id} is never raised above the advertised window`,
+	);
+}
+
+// Non-numeric and non-positive values are ignored with a warning.
+for (const bad of ["abc", "0", "-5", "", "  "]) {
+	const run = await runWithEnv({ PI_ASTERLAB_CONTEXT_WINDOW: bad, PI_ASTERLAB_SKIP_VERIFY: "1" });
+	for (const m of run.provider.getModels()) {
+		assertEq(
+			m.contextWindow,
+			advertisedById.get(m.id) ?? 131_072,
+			`ceiling=${JSON.stringify(bad)}: ${m.id} falls back to the advertised window`,
+		);
+	}
+	if (bad.trim()) {
+		assert(
+			run.warnings.some((line) => line.includes("ignoring PI_ASTERLAB_CONTEXT_WINDOW")),
+			`ceiling=${JSON.stringify(bad)}: invalid value is reported`,
+		);
+	}
+}
+
+console.log(`\nmodels: ${models.map((m) => `${m.id}(${m.contextWindow})`).join(", ")}`);
 console.log(`${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);
